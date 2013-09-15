@@ -43,6 +43,7 @@ public class Player {
   private int audioIdx = -1, videoIdx = -1;
 
   private Thread videoThread = null;
+  private Thread audioThread = null;
 
   private static final
   String
@@ -85,20 +86,31 @@ public class Player {
   }
 
   public void start() {
+    isEOS = false;
+    startMs = System.currentTimeMillis();
+
     videoThread = new VideoThread();
     videoThread.start();
-//    new AudioThread().start();
+
+    audioThread = new AudioThread();
+    audioThread.start();
   }
 
   public void stop() {
     if (null != videoThread) {
       videoThread.interrupt();
     }
+
+    if (null != audioThread) {
+      audioThread.interrupt();
+    }
   }
 
   private double getAudioPtsMs() {
-    if (audioTrack != null) {
-      return (audioTrack.getPlaybackHeadPosition() / audioTrack.getSampleRate()) * 1000.0;
+    synchronized (audioTrack) {
+      if (audioTrack != null) {
+        return (audioTrack.getPlaybackHeadPosition() / (double) audioTrack.getSampleRate()) * 1000.0;
+      }
     }
 
     return 0;
@@ -110,16 +122,18 @@ public class Player {
     if (!isEOS) {
       int inIndex = videoDecoder.dequeueInputBuffer(10000);
 
-      if (inIndex >= 0) {
-        ByteBuffer buffer = videoInputBuffers[inIndex];
-        int videoSampleSize = extractor.readSampleData(buffer, 0);
-        if (videoSampleSize < 0) {
-          Log.d(Const.TAG, "InputBuffer BUFFER_FLAG_END_OF_STREAM");
-          videoDecoder.queueInputBuffer(inIndex, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM);
-          isEOS = true;
-        } else {
-          videoDecoder.queueInputBuffer(inIndex, 0, videoSampleSize, extractor.getSampleTime(), 0);
-          extractor.advance();
+      synchronized (extractor) {
+        if (inIndex >= 0) {
+          ByteBuffer buffer = videoInputBuffers[inIndex];
+          int videoSampleSize = extractor.readSampleData(buffer, 0);
+          if (videoSampleSize < 0) {
+            Log.d(Const.TAG, "InputBuffer BUFFER_FLAG_END_OF_STREAM");
+            videoDecoder.queueInputBuffer(inIndex, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM);
+            isEOS = true;
+          } else {
+            videoDecoder.queueInputBuffer(inIndex, 0, videoSampleSize, extractor.getSampleTime(), 0);
+            extractor.advance();
+          }
         }
       }
     }
@@ -139,9 +153,9 @@ public class Player {
       default:
         ByteBuffer buffer = videoOutputBuffers[outIndex];
 
-        while (info.presentationTimeUs / 1000 > System.currentTimeMillis() - startMs) {
+        while (audioPtsUs > 0 && (info.presentationTimeUs / 1000.0 - getAudioPtsMs()) > 40.0) {
           try {
-//            Log.d(Const.TAG, "Wait video");
+            Log.d(Const.TAG, "Wait video " + info.presentationTimeUs / 1000.0 + " audio " + audioPtsUs / 1000.0);
             Thread.sleep(10);
           } catch (InterruptedException e) {
             e.printStackTrace();
@@ -150,12 +164,10 @@ public class Player {
         }
 
         if ((info.presentationTimeUs / 1000.0 - getAudioPtsMs()) < -40.0) {
-          Log.d(Const.TAG, "SKIP Video frame");
-          videoDecoder.releaseOutputBuffer(outIndex, false);
-        } else {
-          videoDecoder.releaseOutputBuffer(outIndex, true);
+          Log.d(Const.TAG, "Need to SKIP Video frame video " + info.presentationTimeUs / 1000.0 + " audio " + getAudioPtsMs());
         }
 
+        videoDecoder.releaseOutputBuffer(outIndex, true);
         break;
     }
 
@@ -172,7 +184,6 @@ public class Player {
 
       synchronized (extractor) {
         if (inIndex >= 0) {
-//          extractor.selectTrack(audioIdx);
           ByteBuffer buffer = audioInputBuffers[inIndex];
           int audioSampleSize = extractor.readSampleData(buffer, 0);
           if (audioSampleSize < 0) {
@@ -194,6 +205,7 @@ public class Player {
         Log.d(Const.TAG, "INFO_OUTPUT_BUFFERS_CHANGED");
         audioOutputBuffers = audioDecoder.getOutputBuffers();
         break;
+
       case MediaCodec.INFO_OUTPUT_FORMAT_CHANGED:
         MediaFormat format = audioDecoder.getOutputFormat();
         Log.d(Const.TAG, "New format " + format);
@@ -201,14 +213,12 @@ public class Player {
         int sampleRate = format.getInteger(MediaFormat.KEY_SAMPLE_RATE);
         int channelCount = format.getInteger(MediaFormat.KEY_CHANNEL_COUNT);
 
-        int
-            channelConfig =
-            channelCount == 1 ? AudioFormat.CHANNEL_IN_MONO : AudioFormat.CHANNEL_IN_STEREO;
+        int channelConfig = (channelCount == 1)
+                            ? AudioFormat.CHANNEL_IN_MONO
+                            : AudioFormat.CHANNEL_IN_STEREO;
 
-        int
-            bufSize =
-            AudioTrack
-                .getMinBufferSize(sampleRate, channelConfig, AudioFormat.ENCODING_PCM_16BIT);
+        int bufSize =
+            AudioTrack.getMinBufferSize(sampleRate, channelConfig, AudioFormat.ENCODING_PCM_16BIT);
         this.audioTrack =
             new AudioTrack(AudioManager.STREAM_MUSIC, sampleRate, channelConfig,
                            AudioFormat.ENCODING_PCM_16BIT, bufSize, AudioTrack.MODE_STREAM);
@@ -222,8 +232,6 @@ public class Player {
 
       default:
         ByteBuffer buffer = audioOutputBuffers[outIndex];
-        Log.d(Const.TAG, "Got audio buffer");
-
         audioPtsUs = info.presentationTimeUs;
 
         byte[] pcm = new byte[info.size];
@@ -253,27 +261,47 @@ public class Player {
     @Override
     public void run() {
       videoDecoder.start();
-      audioDecoder.start();
 
       ByteBuffer[] videoInputBuffers = videoDecoder.getInputBuffers();
       ByteBuffer[] videoOutputBuffers = videoDecoder.getOutputBuffers();
 
-      ByteBuffer[] audioInputBuffers = audioDecoder.getInputBuffers();
-      ByteBuffer[] audioOutputBuffers = audioDecoder.getOutputBuffers();
-
-      isEOS = false;
-      startMs = System.currentTimeMillis();
 
       while (!Thread.interrupted()) {
-        if (extractor.getSampleTrackIndex() == audioIdx) {
-          processAudio(audioInputBuffers, audioOutputBuffers);
-        } else if (extractor.getSampleTrackIndex() == videoIdx) {
+        int currentTrackIdx = -1;
+        synchronized (extractor) {
+          currentTrackIdx = extractor.getSampleTrackIndex();
+        }
+
+        if (currentTrackIdx == videoIdx) {
           processVideo(videoInputBuffers, videoOutputBuffers);
         }
       }
 
       videoDecoder.stop();
       videoDecoder.release();
+      extractor.release();
+    }
+  }
+
+  private class AudioThread extends Thread {
+
+    @Override
+    public void run() {
+      audioDecoder.start();
+
+      ByteBuffer[] audioInputBuffers = audioDecoder.getInputBuffers();
+      ByteBuffer[] audioOutputBuffers = audioDecoder.getOutputBuffers();
+
+      while (!Thread.interrupted()) {
+        int currentTrackIdx = -1;
+        synchronized (extractor) {
+          currentTrackIdx = extractor.getSampleTrackIndex();
+        }
+
+        if (currentTrackIdx == audioIdx) {
+          processAudio(audioInputBuffers, audioOutputBuffers);
+        }
+      }
 
       audioDecoder.stop();
       audioDecoder.release();
